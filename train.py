@@ -251,21 +251,16 @@ def main(args):
     # Build scheduler
     scheduler = get_lr_scheduler(optimizer, args, len(train_loader))
     
-    # Load checkpoint if resuming
+    # Load checkpoint if resuming (only model weights, restart optimizer/scheduler)
     start_epoch = 0
-    best_val_loss = float('inf')
     
     if args.checkpoint_path and Path(args.checkpoint_path).exists():
         print(f"\nLoading checkpoint: {args.checkpoint_path}")
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model'])
-        if 'optimizer' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
         if 'epoch' in checkpoint:
-            start_epoch = checkpoint['epoch'] + 1
-        if 'best_val_loss' in checkpoint:
-            best_val_loss = checkpoint['best_val_loss']
-        print(f"Resumed from epoch {start_epoch}")
+            print(f"Checkpoint was at epoch {checkpoint['epoch'] + 1}")
+        print("Resuming training from epoch 0 (optimizer/scheduler reinitialized)")
     
     # Training loop
     print(f"\nStarting training for {args.epochs} epochs")
@@ -292,28 +287,12 @@ def main(args):
         print(f"  Val   - Loss: {val_metrics['loss']:.4f}, CE: {val_metrics['loss_ce']:.4f}, "
               f"BBox: {val_metrics['loss_bbox']:.4f}, GIoU: {val_metrics['loss_giou']:.4f}")
         
-        # Save best model
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
+        # Save periodic checkpoint (only model weights and epoch)
+        if (epoch + 1) % args.save_every == 0:
             checkpoint = {
                 'model': model.state_dict(),
-                'epoch': epoch,
-                'best_val_loss': best_val_loss
+                'epoch': epoch
             }
-            torch.save(checkpoint, output_dir / "best_model.pth")
-            print(f"  → Saved best model (val_loss: {best_val_loss:.4f})")
-        
-        # Save last model
-        checkpoint = {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch,
-            'best_val_loss': best_val_loss
-        }
-        torch.save(checkpoint, output_dir / f"last_model_epoch_{epoch+1}.pth")
-        
-        # Save periodic checkpoint
-        if (epoch + 1) % args.save_every == 0:
             torch.save(checkpoint, output_dir / f"checkpoint_epoch_{epoch+1}.pth")
             print(f"  → Saved checkpoint at epoch {epoch+1}")
         
@@ -321,8 +300,8 @@ def main(args):
         with open(output_dir / "history.json", 'w') as f:
             json.dump(history, f, indent=2)
     
-    print(f"\nTraining complete! Best val loss: {best_val_loss:.4f}")
-    print(f"Models saved to: {output_dir}")
+    print(f"\nTraining complete!")
+    print(f"Checkpoints saved to: {output_dir}")
 
 
 if __name__ == "__main__":
