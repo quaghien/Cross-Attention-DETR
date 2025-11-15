@@ -171,19 +171,18 @@ class CrossAttentionDETR(nn.Module):
         # Decoder will cross-attend to ALL template features
         template_encoded = torch.cat(template_encoded_list, dim=1)  # (B, N*H*W, C)
         
+        # Concatenate template and search features as memory
+        # Decoder will cross-attend to BOTH template and search
+        memory = torch.cat([template_encoded, search_encoded], dim=1)  # (B, N*H*W + H*W, C)
+        
         # Prepare queries
         query_embed = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # (B, num_queries, C)
-        
-        # Decode: queries attend to search (self-attn) and template (cross-attn)
-        # In DETR, decoder attends to encoder output (search) via cross-attention
-        # Here we modify: decoder self-attends to queries, cross-attends to template
-        # We need to pass search as tgt and template as memory
         
         # Initialize decoder input with query embeddings
         tgt = torch.zeros_like(query_embed)  # (B, num_queries, C)
         
-        # Decode with cross-attention to template
-        hs = self.decoder(tgt + query_embed, template_encoded)  # (B, num_queries, C)
+        # Decode with cross-attention to both template and search
+        hs = self.decoder(tgt + query_embed, memory)  # (B, num_queries, C)
         
         # Prediction heads
         pred_logits = self.class_head(hs)  # (B, num_queries, 1)

@@ -40,35 +40,38 @@ class HungarianMatcher(nn.Module):
         """
         B, num_queries = outputs["pred_logits"].shape[:2]
         
-        # Flatten batch dimension
-        out_prob = outputs["pred_logits"].flatten(0, 1).sigmoid()  # (B*num_queries, 1)
-        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # (B*num_queries, 4)
+        pred_logits = outputs["pred_logits"]  # (B, num_queries, 1)
+        pred_boxes = outputs["pred_boxes"]  # (B, num_queries, 4)
         
-        # Concatenate target boxes
-        tgt_bbox = torch.cat([t["boxes"] for t in targets])  # (B, 4) - one box per image
-        
-        # Compute classification cost (binary)
-        # Since we have single object, target is always 1
-        cost_class = -out_prob.squeeze(-1)  # (B*num_queries,) - higher prob = lower cost
-        
-        # Compute L1 bbox cost
-        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)  # (B*num_queries, B)
-        
-        # Compute GIoU cost
-        cost_giou = -generalized_box_iou(out_bbox, tgt_bbox)  # (B*num_queries, B)
-        
-        # Final cost matrix
-        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class.unsqueeze(1) + self.cost_giou * cost_giou
-        C = C.view(B, num_queries, -1).cpu()
-        
-        # Perform matching for each batch element
-        sizes = [1 for _ in range(B)]  # Each image has 1 target
         indices = []
-        for i, (c, size) in enumerate(zip(C.split(sizes, -1), sizes)):
-            # c: (num_queries, 1)
-            c = c[i].squeeze(-1)  # (num_queries,)
-            pred_idx = c.argmin().unsqueeze(0)  # Select query with minimum cost
-            tgt_idx = torch.tensor([0], dtype=torch.int64)  # Always match to the single target
+        
+        # Match each batch element separately
+        for i in range(B):
+            # Get predictions for this batch element
+            out_prob = pred_logits[i].sigmoid()  # (num_queries, 1)
+            out_bbox = pred_boxes[i]  # (num_queries, 4)
+            
+            # Get target for this batch element
+            tgt_bbox = targets[i]["boxes"][0]  # (4,)
+            tgt_bbox = tgt_bbox.unsqueeze(0)  # (1, 4) for broadcasting
+            
+            # Compute classification cost (binary)
+            # Since we have single object, target is always 1
+            cost_class = -out_prob.squeeze(-1)  # (num_queries,) - higher prob = lower cost
+            
+            # Compute L1 bbox cost
+            cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1).squeeze(-1)  # (num_queries,)
+            
+            # Compute GIoU cost
+            cost_giou = -generalized_box_iou(out_bbox, tgt_bbox).squeeze(-1)  # (num_queries,)
+            
+            # Final cost for each query
+            C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou  # (num_queries,)
+            
+            # Select query with minimum cost
+            pred_idx = C.argmin().unsqueeze(0)  # (1,)
+            tgt_idx = torch.tensor([0], dtype=torch.int64, device=pred_idx.device)  # Always match to the single target
+            
             indices.append((pred_idx, tgt_idx))
         
         return indices
