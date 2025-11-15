@@ -110,44 +110,66 @@ class CrossAttentionDETR(nn.Module):
         Forward pass.
         
         Args:
-            template: (B, 3, H, W) - Template/reference images
+            template: (B, N, 3, H, W) - Multiple template/reference images (N=1-3)
             search: (B, 3, H, W) - Search images
             
         Returns:
             pred_logits: (B, num_queries, 1) - Classification logits
             pred_boxes: (B, num_queries, 4) - Predicted boxes in [cx, cy, w, h] format (normalized 0-1)
         """
-        B = template.shape[0]
+        B, N = template.shape[0], template.shape[1]
         
-        # Extract features
-        template_feat = self.backbone(template)  # (B, hidden_dim, H', W')
-        search_feat = self.backbone(search)      # (B, hidden_dim, H', W')
+        # Extract features from multiple templates (NO averaging!)
+        # Reshape: (B, N, 3, H, W) -> (B*N, 3, H, W)
+        template_flat = template.reshape(B * N, *template.shape[2:])
+        template_feats = self.backbone(template_flat)  # (B*N, hidden_dim, H', W')
         
-        # Project features
-        template_feat = self.input_proj(template_feat)
+        # Reshape back: (B*N, C, H', W') -> (B, N, C, H', W')
+        C, H_t, W_t = template_feats.shape[1:]
+        template_feats = template_feats.reshape(B, N, C, H_t, W_t)
+        
+        # Extract search features
+        search_feat = self.backbone(search)  # (B, hidden_dim, H', W')
+        
+        # Project search features
         search_feat = self.input_proj(search_feat)
         
-        # Positional encoding
-        template_pos = self.pos_encoder(template_feat)  # (B, hidden_dim, H', W')
-        search_pos = self.pos_encoder(search_feat)      # (B, hidden_dim, H', W')
+        # Positional encoding for search
+        search_pos = self.pos_encoder(search_feat)  # (B, hidden_dim, H', W')
         
-        # Flatten spatial dimensions: (B, C, H, W) -> (B, C, H*W) -> (B, H*W, C)
-        B, C, H, W = search_feat.shape
+        # Flatten search spatial dimensions: (B, C, H, W) -> (B, H*W, C)
+        B, C, H_s, W_s = search_feat.shape
         search_flat = search_feat.flatten(2).permute(0, 2, 1)  # (B, H*W, C)
         search_pos_flat = search_pos.flatten(2).permute(0, 2, 1)  # (B, H*W, C)
         
-        template_flat = template_feat.flatten(2).permute(0, 2, 1)  # (B, H*W, C)
-        template_pos_flat = template_pos.flatten(2).permute(0, 2, 1)  # (B, H*W, C)
-        
-        # Add positional encoding to features
+        # Add positional encoding to search features
         search_with_pos = search_flat + search_pos_flat
-        template_with_pos = template_flat + template_pos_flat
         
-        # Encode search features (optional self-attention)
+        # Encode search features (self-attention)
         search_encoded = self.encoder(search_with_pos)  # (B, H*W, C)
         
-        # Encode template features (use as memory for decoder)
-        template_encoded = self.encoder(template_with_pos)  # (B, H*W, C)
+        # Process ALL templates and concatenate them as memory
+        # Each template becomes part of the memory that decoder attends to
+        template_encoded_list = []
+        for i in range(N):
+            # Project and encode each template
+            template_i = self.input_proj(template_feats[:, i])  # (B, C, H', W')
+            template_pos_i = self.pos_encoder(template_i)  # (B, C, H', W')
+            
+            # Flatten: (B, C, H, W) -> (B, H*W, C)
+            template_flat_i = template_i.flatten(2).permute(0, 2, 1)  # (B, H*W, C)
+            template_pos_flat_i = template_pos_i.flatten(2).permute(0, 2, 1)  # (B, H*W, C)
+            
+            # Add positional encoding
+            template_with_pos_i = template_flat_i + template_pos_flat_i
+            
+            # Encode (self-attention)
+            template_encoded_i = self.encoder(template_with_pos_i)  # (B, H*W, C)
+            template_encoded_list.append(template_encoded_i)
+        
+        # Concatenate all templates: (B, N*H*W, C)
+        # Decoder will cross-attend to ALL template features
+        template_encoded = torch.cat(template_encoded_list, dim=1)  # (B, N*H*W, C)
         
         # Prepare queries
         query_embed = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # (B, num_queries, C)

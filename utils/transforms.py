@@ -1,6 +1,7 @@
 """Image transformation utilities for CA-DETR."""
 
 import random
+import math
 from typing import Callable, Union, Tuple
 from pathlib import Path
 
@@ -19,6 +20,96 @@ def _load_image(image: Union[str, Path, np.ndarray]) -> np.ndarray:
     if image is None:
         raise FileNotFoundError(f"Could not read image: {image}")
     return image
+
+
+def transform_bbox(
+    x_c: float, y_c: float, w: float, h: float,
+    img_size: int,
+    angle: float = 0.0,
+    flip_h: bool = False,
+    flip_v: bool = False,
+) -> Tuple[float, float, float, float]:
+    """
+    Transform bounding box coordinates according to geometric augmentations.
+    
+    Args:
+        x_c, y_c, w, h: Normalized bbox coordinates (0-1) in format (center_x, center_y, width, height)
+        img_size: Image size (assumed square)
+        angle: Rotation angle in degrees (applied first)
+        flip_h: Whether to flip horizontally (applied after rotation)
+        flip_v: Whether to flip vertically (applied after flip_h)
+        
+    Returns:
+        (new_x_c, new_y_c, new_w, new_h): Transformed normalized bbox coordinates
+    """
+    # Convert to pixel coordinates
+    x_c_px = x_c * img_size
+    y_c_px = y_c * img_size
+    w_px = w * img_size
+    h_px = h * img_size
+    
+    # Convert center-based to corner-based for easier transformation
+    x1 = x_c_px - w_px / 2
+    y1 = y_c_px - h_px / 2
+    x2 = x_c_px + w_px / 2
+    y2 = y_c_px + h_px / 2
+    
+    # Get 4 corners
+    corners = np.array([
+        [x1, y1],  # top-left
+        [x2, y1],  # top-right
+        [x2, y2],  # bottom-right
+        [x1, y2],  # bottom-left
+    ], dtype=np.float32)
+    
+    center = np.array([img_size / 2, img_size / 2], dtype=np.float32)
+    
+    # Apply transformations in the same order as image transformation
+    
+    # 1. Rotation (around image center)
+    if abs(angle) > 1e-6:
+        angle_rad = math.radians(angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        rot_matrix = np.array([
+            [cos_a, -sin_a],
+            [sin_a, cos_a]
+        ])
+        corners = (corners - center) @ rot_matrix.T + center
+    
+    # 2. Horizontal flip
+    if flip_h:
+        corners[:, 0] = img_size - corners[:, 0]
+    
+    # 3. Vertical flip
+    if flip_v:
+        corners[:, 1] = img_size - corners[:, 1]
+    
+    # Convert back to center format (bounding box of transformed corners)
+    x_min = corners[:, 0].min()
+    y_min = corners[:, 1].min()
+    x_max = corners[:, 0].max()
+    y_max = corners[:, 1].max()
+    
+    # Clip to image bounds
+    x_min = max(0, x_min)
+    y_min = max(0, y_min)
+    x_max = min(img_size, x_max)
+    y_max = min(img_size, y_max)
+    
+    # Convert back to normalized center format
+    new_x_c = (x_min + x_max) / 2 / img_size
+    new_y_c = (y_min + y_max) / 2 / img_size
+    new_w = (x_max - x_min) / img_size
+    new_h = (y_max - y_min) / img_size
+    
+    # Ensure valid bbox
+    new_w = max(0.01, min(1.0, new_w))
+    new_h = max(0.01, min(1.0, new_h))
+    new_x_c = max(new_w/2, min(1.0 - new_w/2, new_x_c))
+    new_y_c = max(new_h/2, min(1.0 - new_h/2, new_y_c))
+    
+    return new_x_c, new_y_c, new_w, new_h
 
 
 def build_transforms(img_size: int = 640, augment: bool = True) -> Callable:
@@ -54,18 +145,7 @@ def build_transforms(img_size: int = 640, augment: bool = True) -> Callable:
         pil = T.functional.to_pil_image(img)
         tensor = T.functional.to_tensor(pil)
         
-        if augment:
-            if aug_params is None:
-                # Generate random augmentation parameters
-                aug_params = {
-                    'angle': random.uniform(-5, 5),           # Rotation ±5°
-                    'flip_h': random.random() < 0.5,          # H-flip 50%
-                    'flip_v': random.random() < 0.3,          # V-flip 30%
-                    'brightness': random.uniform(0.7, 1.3),   # ±30%
-                    'contrast': random.uniform(0.8, 1.2),     # ±20%
-                    'saturation': random.uniform(0.8, 1.2),   # ±20%
-                }
-            
+        if augment and aug_params is not None:
             # Apply geometric augmentation
             if abs(aug_params['angle']) > 0.1:
                 tensor = TF.rotate(tensor, aug_params['angle'], interpolation=TF.InterpolationMode.BILINEAR, fill=0)

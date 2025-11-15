@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 import torch
 from torch.utils.data import Dataset
 
-from .transforms import build_transforms
+from .transforms import build_transforms, transform_bbox
 
 
 class ReferenceDetectionDataset(Dataset):
@@ -133,15 +133,15 @@ class ReferenceDetectionDataset(Dataset):
         
         Returns:
             Dict with:
-            - template: (3, H, W) - Template image tensor
+            - template: (3, H, W) - Template image tensor (averaged from multiple templates)
             - search: (3, H, W) - Search image tensor
             - bbox: (4,) - Ground truth bbox [cx, cy, w, h] (normalized)
             - label: (1,) - Class label (always 1 for single-object detection)
         """
         video_id, img_path, label_path = self.samples[idx]
         
-        # Get template (random if multiple available)
-        template_path = random.choice(self.template_paths[video_id])
+        # Get all templates for this video
+        template_paths = self.template_paths[video_id]
         
         # Parse label
         x_c, y_c, w, h = self._parse_label(label_path)
@@ -160,19 +160,43 @@ class ReferenceDetectionDataset(Dataset):
                 'contrast': random.uniform(0.8, 1.2),
                 'saturation': random.uniform(0.8, 1.2),
             }
+        else:
+            # No augmentation - pass empty dict to disable aug
+            aug_params = {
+                'angle': 0.0,
+                'flip_h': False,
+                'flip_v': False,
+                'brightness': 1.0,
+                'contrast': 1.0,
+                'saturation': 1.0,
+            }
         
-        # Transform images (with same geometric augmentation)
-        template_tensor = self.transform(template_path, aug_params=aug_params)
+        # Transform all templates (NO averaging at pixel level!)
+        # We'll average FEATURES in the model, not pixels
+        template_tensors = []
+        for template_path in template_paths[:3]:  # Use up to 3 templates
+            template_tensor = self.transform(template_path, aug_params=aug_params)
+            template_tensors.append(template_tensor)
+        
+        # Stack templates: (N, 3, H, W) where N = 1-3
+        templates = torch.stack(template_tensors)  # (N, 3, H, W)
+        
+        # Transform search image
         search_tensor = self.transform(img_path, aug_params=aug_params)
         
-        # Note: For DETR-style models, bbox augmentation is typically handled
-        # by the model/loss (since we use normalized coords and simple augmentations)
-        # For more complex augmentations, you'd need to transform bbox coords too
+        # Transform bbox to match image augmentation
+        x_c_aug, y_c_aug, w_aug, h_aug = transform_bbox(
+            x_c, y_c, w, h,
+            img_size=self.img_size,
+            angle=aug_params['angle'],
+            flip_h=aug_params['flip_h'],
+            flip_v=aug_params['flip_v']
+        )
         
         return {
-            'template': template_tensor,
+            'templates': templates,  # (N, 3, H, W) - multiple templates
             'search': search_tensor,
-            'bbox': torch.tensor([x_c, y_c, w, h], dtype=torch.float32),
+            'bbox': torch.tensor([x_c_aug, y_c_aug, w_aug, h_aug], dtype=torch.float32),
             'label': torch.tensor([1], dtype=torch.int64)  # Binary: object present
         }
 
@@ -185,11 +209,24 @@ def collate_fn(batch: List[Dict]) -> Tuple[torch.Tensor, torch.Tensor, List[Dict
         batch: List of samples from __getitem__
         
     Returns:
-        templates: (B, 3, H, W) - Batched template images
+        templates: (B, N, 3, H, W) - Batched template images (N=1-3 templates per sample)
         searches: (B, 3, H, W) - Batched search images
         targets: List of dicts with 'boxes' (1, 4) and 'labels' (1,)
     """
-    templates = torch.stack([item['template'] for item in batch])
+    # Stack templates: each item['templates'] is (N, 3, H, W)
+    # We need to pad to max_num_templates in batch
+    max_num_templates = max(item['templates'].shape[0] for item in batch)
+    
+    templates_list = []
+    for item in batch:
+        t = item['templates']  # (N, 3, H, W)
+        # Pad to max_num_templates if needed
+        if t.shape[0] < max_num_templates:
+            pad = torch.zeros(max_num_templates - t.shape[0], *t.shape[1:])
+            t = torch.cat([t, pad], dim=0)
+        templates_list.append(t)
+    
+    templates = torch.stack(templates_list)  # (B, max_N, 3, H, W)
     searches = torch.stack([item['search'] for item in batch])
     
     targets = []
