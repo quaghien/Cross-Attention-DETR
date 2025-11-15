@@ -79,7 +79,8 @@ class SetCriterion(nn.Module):
         alpha_t = self.focal_alpha * target_classes + (1 - self.focal_alpha) * (1 - target_classes)
         focal_weight = alpha_t * (1 - p_t) ** self.focal_gamma
         
-        loss_ce = (focal_weight * ce_loss).sum() / num_boxes
+        # Normalize by number of queries instead of num_boxes to avoid near-zero loss
+        loss_ce = (focal_weight * ce_loss).sum() / max(pred_logits.shape[0] * pred_logits.shape[1], 1)
         
         losses = {'loss_ce': loss_ce}
         return losses

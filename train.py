@@ -107,6 +107,29 @@ def train_one_epoch(model, criterion, loader, optimizer, scheduler, device, epoc
     }
 
 
+def compute_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Compute IoU between two sets of boxes in [cx, cy, w, h] format."""
+    # Convert to [x1, y1, x2, y2]
+    b1_x1, b1_y1 = boxes1[:, 0] - boxes1[:, 2] / 2, boxes1[:, 1] - boxes1[:, 3] / 2
+    b1_x2, b1_y2 = boxes1[:, 0] + boxes1[:, 2] / 2, boxes1[:, 1] + boxes1[:, 3] / 2
+    b2_x1, b2_y1 = boxes2[:, 0] - boxes2[:, 2] / 2, boxes2[:, 1] - boxes2[:, 3] / 2
+    b2_x2, b2_y2 = boxes2[:, 0] + boxes2[:, 2] / 2, boxes2[:, 1] + boxes2[:, 3] / 2
+    
+    # Intersection
+    inter_x1 = torch.max(b1_x1, b2_x1)
+    inter_y1 = torch.max(b1_y1, b2_y1)
+    inter_x2 = torch.min(b1_x2, b2_x2)
+    inter_y2 = torch.min(b1_y2, b2_y2)
+    inter_area = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+    
+    # Union
+    b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+    b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+    union_area = b1_area + b2_area - inter_area
+    
+    return inter_area / (union_area + 1e-6)
+
+
 def evaluate(model, criterion, loader, device, epoch: int) -> Dict[str, float]:
     """Evaluate model."""
     model.eval()
@@ -114,6 +137,8 @@ def evaluate(model, criterion, loader, device, epoch: int) -> Dict[str, float]:
     total_loss_ce = 0.0
     total_loss_bbox = 0.0
     total_loss_giou = 0.0
+    total_iou = 0.0
+    num_samples = 0
     
     with torch.no_grad():
         pbar = tqdm(loader, desc=f"Epoch {epoch+1} [Val]", ncols=120)
@@ -147,12 +172,22 @@ def evaluate(model, criterion, loader, device, epoch: int) -> Dict[str, float]:
             total_loss_bbox += losses.get('loss_bbox', 0).item()
             total_loss_giou += losses.get('loss_giou', 0).item()
             
+            # Compute IoU for first query (best prediction)
+            batch_size = pred_boxes.shape[0]
+            for i in range(batch_size):
+                pred_box = pred_boxes[i, 0].unsqueeze(0)  # (1, 4)
+                gt_box = targets[i]['boxes'][0].unsqueeze(0)  # (1, 4)
+                iou = compute_iou(pred_box, gt_box).item()
+                total_iou += iou
+                num_samples += 1
+            
             # Update progress bar
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "ce": f"{losses.get('loss_ce', 0).item():.4f}",
                 "bbox": f"{losses.get('loss_bbox', 0).item():.4f}",
-                "giou": f"{losses.get('loss_giou', 0).item():.4f}"
+                "giou": f"{losses.get('loss_giou', 0).item():.4f}",
+                "iou": f"{total_iou/num_samples:.4f}"
             })
     
     steps = len(loader)
@@ -161,6 +196,7 @@ def evaluate(model, criterion, loader, device, epoch: int) -> Dict[str, float]:
         "loss_ce": total_loss_ce / steps,
         "loss_bbox": total_loss_bbox / steps,
         "loss_giou": total_loss_giou / steps,
+        "mean_iou": total_iou / num_samples if num_samples > 0 else 0.0,
     }
 
 
@@ -267,8 +303,15 @@ def main(args):
     history = []
     
     for epoch in range(start_epoch, args.epochs):
+        # Debug: Check model parameters before training
+        param_sum_before = sum(p.sum().item() for p in model.parameters())
+        
         # Train
         train_metrics = train_one_epoch(model, criterion, train_loader, optimizer, scheduler, device, epoch)
+        
+        # Debug: Check model parameters after training
+        param_sum_after = sum(p.sum().item() for p in model.parameters())
+        print(f"[Debug] Param sum before: {param_sum_before:.6f}, after: {param_sum_after:.6f}, diff: {abs(param_sum_after - param_sum_before):.6f}")
         
         # Validate
         val_metrics = evaluate(model, criterion, val_loader, device, epoch)
@@ -285,7 +328,8 @@ def main(args):
         print(f"  Train - Loss: {train_metrics['loss']:.4f}, CE: {train_metrics['loss_ce']:.4f}, "
               f"BBox: {train_metrics['loss_bbox']:.4f}, GIoU: {train_metrics['loss_giou']:.4f}")
         print(f"  Val   - Loss: {val_metrics['loss']:.4f}, CE: {val_metrics['loss_ce']:.4f}, "
-              f"BBox: {val_metrics['loss_bbox']:.4f}, GIoU: {val_metrics['loss_giou']:.4f}")
+              f"BBox: {val_metrics['loss_bbox']:.4f}, GIoU: {val_metrics['loss_giou']:.4f}, "
+              f"IoU: {val_metrics['mean_iou']:.4f}")
         
         # Save periodic checkpoint (only model weights and epoch)
         if (epoch + 1) % args.save_every == 0:
